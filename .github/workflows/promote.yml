@@ -1,0 +1,108 @@
+name: Promote Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service to promote"
+        required: true
+        type: choice
+        options:
+          - sample-nextjs-app
+      from_environment:
+        description: "Source environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+      to_environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      image_tag:
+        description: "Image tag to promote (e.g., sha-abc1234)"
+        required: true
+        type: string
+
+  repository_dispatch:
+    types: [image-built]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-promotion:
+    name: Validate Promotion Path
+    runs-on: ubuntu-latest
+    outputs:
+      service: ${{ steps.params.outputs.service }}
+      target_env: ${{ steps.params.outputs.target_env }}
+      image_tag: ${{ steps.params.outputs.image_tag }}
+    steps:
+      - name: Set Parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "service=${{ github.event.client_payload.service }}" >> "$GITHUB_OUTPUT"
+            echo "target_env=dev" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${{ github.event.client_payload.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "Triggered by repository_dispatch: deploying ${{ github.event.client_payload.service }}:${{ github.event.client_payload.image_tag }} to dev"
+          else
+            # Validate promotion path
+            FROM="${{ github.event.inputs.from_environment }}"
+            TO="${{ github.event.inputs.to_environment }}"
+            if [ "$FROM" = "dev" ] && [ "$TO" = "prod" ]; then
+              echo "::error::Cannot promote directly from dev to prod. Promote to staging first."
+              exit 1
+            fi
+            echo "service=${{ github.event.inputs.service }}" >> "$GITHUB_OUTPUT"
+            echo "target_env=${{ github.event.inputs.to_environment }}" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  create-promotion-pr:
+    name: Create Promotion PR
+    needs: validate-promotion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update image tag in environment config
+        run: |
+          ENV="${{ needs.validate-promotion.outputs.target_env }}"
+          SERVICE="${{ needs.validate-promotion.outputs.service }}"
+          TAG="${{ needs.validate-promotion.outputs.image_tag }}"
+          FILE="environments/${ENV}/main.tf"
+
+          echo "Updating ${SERVICE} image tag to ${TAG} in ${FILE}"
+
+          # Replace :latest or :sha-* with the new tag
+          sed -i "s|/${SERVICE}:[^\"]*|/${SERVICE}:${TAG}|g" "$FILE"
+
+          echo "Updated content:"
+          grep -A2 "image" "$FILE"
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: promote/${{ needs.validate-promotion.outputs.service }}-${{ needs.validate-promotion.outputs.target_env }}-${{ needs.validate-promotion.outputs.image_tag }}
+          title: "Promote ${{ needs.validate-promotion.outputs.service }} to ${{ needs.validate-promotion.outputs.target_env }} (${{ needs.validate-promotion.outputs.image_tag }})"
+          body: |
+            ## Promotion
+
+            | Field | Value |
+            |-------|-------|
+            | **Service** | ${{ needs.validate-promotion.outputs.service }} |
+            | **Target** | ${{ needs.validate-promotion.outputs.target_env }} |
+            | **Image Tag** | `${{ needs.validate-promotion.outputs.image_tag }}` |
+            | **Triggered by** | ${{ github.event_name }} |
+
+            Terraform plan will run automatically on this PR.
+            Review the plan, then merge to apply.
+          commit-message: "Promote ${{ needs.validate-promotion.outputs.service }} to ${{ needs.validate-promotion.outputs.target_env }} (${{ needs.validate-promotion.outputs.image_tag }})"
+          labels: promotion
