@@ -1,7 +1,7 @@
 module "sample_nextjs_app" {
   source = "../../modules/cloud-run-service"
 
-  project_id  = var.project_id
+  project_id   = var.project_id
   service_name = "sample-nextjs-app"
   region       = var.region
   image        = "${var.artifact_registry_repo}/sample-nextjs-app:latest"
