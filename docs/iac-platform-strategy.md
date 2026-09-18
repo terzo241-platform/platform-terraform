@@ -443,7 +443,94 @@ This means:
 
 ---
 
-## 8. The Alignment Playbook: Getting Teams On Board
+## 8. Deployment Models: Two Paths, One Truth
+
+A critical alignment question you'll face: **"Should we deploy via `gcloud run deploy`
+(direct) or via Terraform apply (GitOps)?"**
+
+The answer: **both exist, for different stages of maturity.**
+
+### 8.1 Direct Deploy (Day 5 Pattern)
+
+```
+sample-nextjs-app push to main
+  → CI: build + scan + sign + push to AR
+  → Deploy workflow: gcloud run deploy --image=IMAGE
+  → Live on Cloud Run
+```
+
+**Pros:** Fast. Simple. Developer sees result in 3 minutes.
+**Cons:** Terraform state doesn't know about it. Config drift. No plan review.
+
+**When to use:** Early adoption (Wave 0-1). Teams not ready for full GitOps.
+Dev environment only. Quick iteration loops.
+
+### 8.2 GitOps Deploy (Day 8-9 Pattern)
+
+```
+sample-nextjs-app push to main
+  → CI: build + scan + sign + push to AR
+  → GitOps Bridge: fires repository_dispatch to platform-terraform
+  → Promotion workflow: creates PR with updated image tag
+  → terraform plan runs → posted as PR comment
+  → Review + merge → terraform apply
+  → Live on Cloud Run (state tracked, labels applied, guardrails enforced)
+```
+
+**Pros:** Full audit trail. State managed. Plan reviewed. Guardrails enforced.
+**Cons:** Slower (PR cycle). More moving parts.
+
+**When to use:** Staging and production. Mature teams. Regulated workloads.
+
+### 8.3 The Promotion Flow (Day 9)
+
+```
+CODE CHANGE ──→ dev (auto) ──→ staging (tag) ──→ prod (manual approval)
+
+Push to main:
+  CI builds sha-abc1234
+  GitOps Bridge fires → platform-terraform
+  Auto-PR → plan → auto-merge for dev
+  Image tag updated in environments/dev/main.tf
+
+Tag v1.2.0-rc1:
+  Manual dispatch: promote sample-nextjs-app from dev to staging
+  Creates PR → plan → team lead reviews → merge → apply
+
+Manual dispatch: promote to prod:
+  Validates: can't skip staging (dev→prod blocked)
+  Creates PR → plan → platform team reviews → merge → apply
+  GitHub Environment protection rule: requires 2 approvers
+```
+
+**Why dev→prod skip is blocked:** Because you've BEEN there. A developer promoting
+directly to prod skips the staging validation that would have caught the connection
+pool issue, the memory spike, the slow query. The promotion workflow enforces the
+path: dev → staging → prod. No exceptions. The guardrail is in the workflow, not
+in a wiki page nobody reads.
+
+### 8.4 Atlantis vs GHA: The Ford Context
+
+Your question about Atlantis vs GHA is the right one. Here's the honest answer:
+
+| Dimension | GHA (this POC) | Atlantis (your CAMS setup) |
+|---|---|---|
+| **Best for** | Platform team's central repo | 100+ team repos with per-workspace config |
+| **Workspace locking** | Concurrency groups (basic) | Built-in, battle-tested |
+| **Multi-repo** | Separate workflows per repo | One instance serves many repos (repos.yaml) |
+| **Air-gapped** | Self-hosted runners on GKE | Pod in your cluster (already running) |
+| **SA impersonation** | OIDC per environment | Per-workspace SA (your existing setup) |
+| **State management** | You manage | You manage (same) |
+| **The Ford recommendation** | Use for platform-terraform (central) | Use for team repos (scale) |
+
+**For this POC, GHA demonstrates the developer experience.** For Ford at scale,
+Atlantis (which you already operate) handles the operational complexity of 130+
+workspaces across 6 instances. The MODULE is the same either way — the engine that
+runs plan/apply is an operational choice, not an architectural one.
+
+---
+
+## 9. The Alignment Playbook: Getting Teams On Board
 
 ### The Conversation Map (What You'll Actually Hear)
 
