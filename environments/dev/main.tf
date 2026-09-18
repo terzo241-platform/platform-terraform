@@ -30,3 +30,18 @@ module "sample_nextjs_app" {
     app = "sample-nextjs-app"
   }
 }
+
+module "static_assets" {
+  source = "../../modules/gcs-bucket"
+
+  project_id  = var.project_id
+  name        = "${var.project_id}-static-assets-dev"
+  location    = var.region
+  environment = "dev"
+
+  team        = "marketing-web"
+  cost_center = "MKT-40210"
+
+  versioning         = true
+  lifecycle_age_days = 90
+}
