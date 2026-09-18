@@ -443,73 +443,118 @@ This means:
 
 ---
 
-## 8. Deployment Models: Two Paths, One Truth
+## 8. Separation of Concerns: Infrastructure vs App Releases
 
-A critical alignment question you'll face: **"Should we deploy via `gcloud run deploy`
-(direct) or via Terraform apply (GitOps)?"**
+This is the most important architectural decision in the IaC pillar, and the one
+most teams get wrong. Getting it right determines whether your platform scales
+or becomes a bottleneck.
 
-The answer: **both exist, for different stages of maturity.**
-
-### 8.1 Direct Deploy (Day 5 Pattern)
-
-```
-sample-nextjs-app push to main
-  → CI: build + scan + sign + push to AR
-  → Deploy workflow: gcloud run deploy --image=IMAGE
-  → Live on Cloud Run
-```
-
-**Pros:** Fast. Simple. Developer sees result in 3 minutes.
-**Cons:** Terraform state doesn't know about it. Config drift. No plan review.
-
-**When to use:** Early adoption (Wave 0-1). Teams not ready for full GitOps.
-Dev environment only. Quick iteration loops.
-
-### 8.2 GitOps Deploy (Day 8-9 Pattern)
+### 8.1 The Core Principle: Terraform Manages WHAT Exists, CI/CD Manages WHAT VERSION Runs
 
 ```
-sample-nextjs-app push to main
-  → CI: build + scan + sign + push to AR
-  → GitOps Bridge: fires repository_dispatch to platform-terraform
-  → Promotion workflow: creates PR with updated image tag
-  → terraform plan runs → posted as PR comment
-  → Review + merge → terraform apply
-  → Live on Cloud Run (state tracked, labels applied, guardrails enforced)
+INFRASTRUCTURE (Terraform)                APP RELEASES (CI/CD)
+──────────────────────────                ──────────────────────
+Changes: monthly                          Changes: daily/weekly
+Owner: platform team                      Owner: app team
+Concern: "does the Cloud Run service      Concern: "which version of my code
+  exist with the right scaling,             is running in staging right now?"
+  networking, IAM, and labels?"
+
+Examples:                                 Examples:
+  - Create Cloud Run service              - Build image sha-abc1234
+  - Set max_instances = 20                - Deploy sha-abc1234 to dev
+  - Set ingress = INTERNAL_ONLY           - Promote sha-abc1234 to staging
+  - Configure VPC connector               - Promote sha-abc1234 to prod
+  - Set enforced labels
+  - Create GCS bucket
+
+Lives in: platform-terraform              Lives in: sample-nextjs-app deploy.yml
+Trigger: PR to platform-terraform         Trigger: push to main, git tag, manual dispatch
 ```
 
-**Pros:** Full audit trail. State managed. Plan reviewed. Guardrails enforced.
-**Cons:** Slower (PR cycle). More moving parts.
+**Why this matters:** If you put image tags in Terraform, every app release becomes
+a Terraform PR → plan → apply cycle. A developer pushing a bug fix now has to:
+1. Wait for CI to build the image
+2. Open a PR in platform-terraform to update the image tag
+3. Wait for terraform plan
+4. Wait for review
+5. Merge → terraform apply
 
-**When to use:** Staging and production. Mature teams. Regulated workloads.
+That's 15-30 minutes for a hot fix that should take 3 minutes. **Developers will
+bypass this immediately.** And they'd be right to.
 
-### 8.3 The Promotion Flow (Day 9)
+### 8.2 The Right Pattern: App Promotion via CI/CD
 
-```
-CODE CHANGE ──→ dev (auto) ──→ staging (tag) ──→ prod (manual approval)
+The `deploy.yml` in sample-nextjs-app (built Day 5) IS the promotion workflow:
 
-Push to main:
-  CI builds sha-abc1234
-  GitOps Bridge fires → platform-terraform
-  Auto-PR → plan → auto-merge for dev
-  Image tag updated in environments/dev/main.tf
+```yaml
+# This is already in sample-nextjs-app/.github/workflows/deploy.yml:
 
-Tag v1.2.0-rc1:
-  Manual dispatch: promote sample-nextjs-app from dev to staging
-  Creates PR → plan → team lead reviews → merge → apply
-
-Manual dispatch: promote to prod:
-  Validates: can't skip staging (dev→prod blocked)
-  Creates PR → plan → platform team reviews → merge → apply
-  GitHub Environment protection rule: requires 2 approvers
+deploy-dev:      # auto on push to main
+deploy-staging:  # auto on git tag v*-rc*
+deploy-prod:     # manual workflow_dispatch, GitHub Environment requires 2 approvers
 ```
 
-**Why dev→prod skip is blocked:** Because you've BEEN there. A developer promoting
-directly to prod skips the staging validation that would have caught the connection
-pool issue, the memory spike, the slow query. The promotion workflow enforces the
-path: dev → staging → prod. No exceptions. The guardrail is in the workflow, not
-in a wiki page nobody reads.
+The promotion flow:
 
-### 8.4 Atlantis vs GHA: The Ford Context
+```
+Developer pushes bug fix to main
+  → CI: build → scan → sign → push sha-abc1234 to Artifact Registry
+  → deploy-dev: gcloud run deploy --image=sha-abc1234 (auto, 2 minutes)
+  → Developer tests in dev, looks good
+
+Developer creates tag: git tag v1.2.1-rc1 && git push --tags
+  → deploy-staging: gcloud run deploy --image=sha-abc1234 (auto, 2 minutes)
+  → QA validates in staging
+
+Developer triggers manual dispatch: environment=prod
+  → GitHub Environment protection: requires 2 approvals
+  → Approvers review → approve
+  → deploy-prod: gcloud run deploy --image=sha-abc1234 (2 minutes)
+
+Total time from code push to prod: approval wait + 6 minutes of automation
+```
+
+**The image is immutable.** The same `sha-abc1234` binary runs in dev, staging, and
+prod. Only the environment config differs (scaling, networking, env vars) — and those
+are set by the deploy workflow inputs or GitHub Environment variables, not by Terraform.
+
+### 8.3 What Terraform DOES Manage (And When It Changes)
+
+Terraform manages the infrastructure that the app deploys INTO:
+
+```
+When Terraform changes (rare):              When CI/CD changes (frequent):
+─────────────────────────────               ────────────────────────────────
+"We need to increase max_instances           "Deploy the new feature to staging"
+  from 10 to 20 for Black Friday"           "Roll back to previous version"
+"Add a VPC connector for the new             "Hot fix to prod"
+  private database"
+"Create a new service for the               These NEVER touch Terraform.
+  data-pipeline team"                       They use gcloud run deploy
+"Change ingress from ALL to                   with the image tag.
+  INTERNAL_LOAD_BALANCER"
+```
+
+**Rule of thumb:** If the change is about the app's code or version → CI/CD.
+If the change is about the infrastructure surrounding the app → Terraform.
+
+### 8.4 When Full GitOps (Image Tags in Terraform) Makes Sense
+
+There IS a legitimate use case for tracking image tags in Terraform — but it's the
+exception, not the default:
+
+| Scenario | Pattern | Why |
+|---|---|---|
+| **Most teams (90%)** | CI/CD promotion (deploy.yml) | Fast, simple, app team owns it |
+| **SOX-regulated services** | Full GitOps (image in Terraform) | Auditors need git history of every image change per environment |
+| **Multi-service stacks** | Full GitOps | 5 services must deploy together atomically — Terraform ensures consistency |
+| **Canary/blue-green** | CI/CD with traffic splitting | `gcloud run services update-traffic` — not a Terraform concern |
+
+The `promote.yml` workflow in platform-terraform exists for that 10% of regulated
+workloads. For everything else, `deploy.yml` in the app repo is the right answer.
+
+### 8.5 Atlantis vs GHA: The Ford Context
 
 Your question about Atlantis vs GHA is the right one. Here's the honest answer:
 
@@ -527,6 +572,28 @@ Your question about Atlantis vs GHA is the right one. Here's the honest answer:
 Atlantis (which you already operate) handles the operational complexity of 130+
 workspaces across 6 instances. The MODULE is the same either way — the engine that
 runs plan/apply is an operational choice, not an architectural one.
+
+### 8.6 Summary: Who Owns What
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  PLATFORM TEAM owns:                APP TEAM owns:              │
+│  ─────────────────                  ──────────────              │
+│  platform-terraform/                sample-nextjs-app/          │
+│  ├── modules/ (guardrails)          ├── src/ (app code)         │
+│  ├── environments/ (infra config)   ├── Dockerfile              │
+│  └── terraform.yml (plan/apply)     ├── ci.yml (build/scan)     │
+│                                     └── deploy.yml (promotion)  │
+│  Changes rarely.                    Changes daily.              │
+│  Reviewed by platform team.         Reviewed by app team.       │
+│  "What infrastructure exists?"      "What version is running?"  │
+│                                                                 │
+│  These two concerns are SEPARATE.                               │
+│  Mixing them creates a bottleneck.                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
