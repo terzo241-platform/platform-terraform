@@ -1,0 +1,205 @@
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.9.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  detect-changes:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.changes.outputs.environments }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Detect which environments changed
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- environments/ | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          else
+            CHANGED=$(git diff --name-only HEAD~1 -- environments/ | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          fi
+
+          if [ "$CHANGED" = "[]" ] || [ -z "$CHANGED" ]; then
+            # Module-only changes — run plan against all environments
+            CHANGED='["dev"]'
+          fi
+
+          echo "environments=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "Changed environments: $CHANGED"
+
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate Module Syntax
+        run: |
+          for module_dir in modules/*/; do
+            echo "=== Validating $module_dir ==="
+            cd "$module_dir"
+            terraform init -backend=false
+            terraform validate
+            cd "$GITHUB_WORKSPACE"
+          done
+
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: [detect-changes, validate]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # GCP OIDC auth — only runs when WIF is configured
+      - name: Authenticate to GCP
+        if: vars.WIF_PROVIDER != ''
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.TF_SERVICE_ACCOUNT }}
+
+      - name: Terraform Init
+        id: init
+        working-directory: environments/${{ matrix.environment }}
+        run: |
+          if [ -n "${{ vars.WIF_PROVIDER }}" ]; then
+            terraform init
+          else
+            echo "::notice::GCP credentials not configured — running init with -backend=false"
+            terraform init -backend=false
+          fi
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ matrix.environment }}
+        continue-on-error: true
+        run: |
+          if [ -n "${{ vars.WIF_PROVIDER }}" ]; then
+            terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          else
+            echo "::notice::GCP credentials not configured — running plan without backend"
+            terraform plan -no-color 2>&1 | tee plan_output.txt || true
+          fi
+
+          # Truncate plan output if too long for PR comment (64KB limit)
+          if [ $(wc -c < plan_output.txt) -gt 60000 ]; then
+            head -c 30000 plan_output.txt > plan_truncated.txt
+            echo -e "\n\n... (plan output truncated — see workflow run for full output) ...\n" >> plan_truncated.txt
+            tail -c 25000 plan_output.txt >> plan_truncated.txt
+            mv plan_truncated.txt plan_output.txt
+          fi
+
+      - name: Post Plan to PR
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## Terraform Plan: `${{ matrix.environment }}` ${{ steps.plan.outcome == 'success' && '✅' || '❌' }}
+
+            <details>
+            <summary>Click to expand plan output</summary>
+
+            ```hcl
+            ${{ steps.plan.outputs.stdout || 'See plan_output.txt in workflow artifacts' }}
+            ```
+
+            </details>
+
+            **Init:** ${{ steps.init.outcome }} | **Plan:** ${{ steps.plan.outcome }}
+
+            > 🔒 Plan runs automatically on PR. Apply runs on merge to `main`.
+            > Review the plan carefully — merged changes deploy to `${{ matrix.environment }}`.
+
+      - name: Upload Plan Artifact
+        if: steps.plan.outcome == 'success' && vars.WIF_PROVIDER != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: environments/${{ matrix.environment }}/tfplan
+          retention-days: 5
+
+      - name: Fail if Plan Failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    name: Apply (${{ matrix.environment }})
+    needs: [detect-changes, validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      fail-fast: false
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: terraform-${{ matrix.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Authenticate to GCP
+        if: vars.WIF_PROVIDER != ''
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.TF_SERVICE_ACCOUNT }}
+
+      - name: Terraform Init
+        working-directory: environments/${{ matrix.environment }}
+        run: |
+          if [ -n "${{ vars.WIF_PROVIDER }}" ]; then
+            terraform init
+          else
+            echo "::notice::GCP credentials not configured — skipping apply"
+            echo "SKIP_APPLY=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Terraform Apply
+        if: env.SKIP_APPLY != 'true'
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform apply -auto-approve -no-color

@@ -509,7 +509,142 @@ Wave 4 (Month 10-12): Sunset Manual
 
 ---
 
-## 10. The Bottom Line: What This Module Really Is
+## 10. GitOps CI/CD: The Workflow That Makes Self-Service Real
+
+The module encodes WHAT to build. The GitOps workflow enforces HOW changes flow.
+Without this workflow, a developer could write perfect Terraform and still deploy it
+by running `terraform apply` from their laptop at 11 PM — no review, no audit trail,
+no rollback plan.
+
+### 10.1 The Problem This Solves
+
+```
+WITHOUT GITOPS:                              WITH GITOPS:
+
+Developer writes Terraform                    Developer writes Terraform
+  ↓                                             ↓
+terraform apply (from laptop)                 git push → opens PR
+  ↓                                             ↓
+Applied. Nobody reviewed.                     terraform plan runs automatically
+Nobody knows what changed.                    Plan output posted as PR comment
+If it breaks at 2 AM,                           ↓
+  nobody knows what was changed,              Reviewer sees: "3 to add, 0 to destroy"
+  when, or by whom.                           Reviewer approves
+                                                ↓
+terraform destroy (from someone                Merge to main
+  else's laptop, different state)               ↓
+  ↓                                           terraform apply runs in CI
+Now you have state corruption.                  ↓
+                                              Applied. Reviewed. Auditable. Reversible.
+                                              Git log = complete history of every
+                                              infrastructure change.
+```
+
+### 10.2 Why PR-Based Plan Is a Guardrail, Not Just a Feature
+
+The `terraform plan` comment on the PR is the second guardrail layer (after module
+validations). It answers three questions that validations can't:
+
+1. **"What exactly will change?"** — The plan shows resources being added, modified,
+   or destroyed. A developer adding a Cloud Run service sees `3 to add`. If they see
+   `12 to destroy`, something is wrong — the plan catches it before apply.
+
+2. **"Is this what I intended?"** — A developer might change one variable and not
+   realize it triggers a replacement (destroy + recreate) of the service. The plan
+   makes this visible: `must be replaced` next to the resource.
+
+3. **"Is this safe for production?"** — For staging/prod PRs, the platform team
+   reviews the plan. Not the code — the PLAN. "The code looks right" is not the same
+   as "the plan shows the right changes." Terraform can do unexpected things.
+
+### 10.3 The Flow
+
+```
+DEVELOPER                    GITHUB ACTIONS                 GCP
+────────                     ──────────────                 ───
+git checkout -b add-svc
+Write 7 lines of module call
+git push → open PR ─────────→ PR event triggers workflow
+                               ↓
+                             terraform fmt -check
+                             terraform validate
+                             terraform plan
+                               ↓
+                             Plan posted as PR comment ←──── Developer reads plan
+                             "3 to add, 0 to destroy"
+                               ↓
+Reviewer approves PR
+Merge to main ──────────────→ Push event triggers workflow
+                               ↓
+                             OIDC auth (no stored creds)
+                             terraform init
+                             terraform apply ──────────────→ Resources created
+                               ↓
+                             Apply succeeds
+                             Git log = audit trail
+```
+
+### 10.4 Key Design Decisions
+
+| Decision | Why | What It Prevents |
+|---|---|---|
+| Plan on PR, apply on merge | Separation of review and execution | Unreviewed changes reaching prod |
+| OIDC auth (no stored keys) | Day 5 WIF pattern — no secrets in GitHub | Credential leak, rotation burden |
+| Concurrency lock per environment | One apply at a time per env | State corruption from parallel applies |
+| Environment protection rules | Staging/prod require approval | Accidental prod deploys |
+| Matrix strategy (per environment) | Changed environments only | Unnecessary plans/applies |
+| Plan output on PR comment | Visibility without clicking into workflow | Reviewer sees impact without leaving PR |
+| `-auto-approve` on merge only | Merge IS the approval | No human at keyboard during apply |
+
+### 10.5 How the Agent Uses This (Pillar 3 Preview)
+
+When the agent (Day 10+) handles "deploy a new service," it doesn't bypass this
+workflow. It follows the exact same path:
+
+```
+Developer: "Deploy a new service called customer-api"
+
+Agent:
+  1. Creates branch: add-customer-api
+  2. Writes module call (7 lines) to environments/dev/main.tf
+  3. Opens PR → plan runs automatically
+  4. Plan posted on PR → agent reads the plan
+  5. Agent reports to developer: "Plan shows 3 resources to add"
+  6. Developer says "merge it" → agent merges
+  7. Apply runs → resources created
+  8. Agent reports: "Service deployed at https://..."
+```
+
+The agent accelerates steps 1-3 and 6-8. But steps 4-5 (plan + review) still
+happen — the guardrail is never bypassed. This is why the main strategy says
+"the agent IS the process" — it doesn't shortcut the process, it makes the
+process faster.
+
+### 10.6 Reusable Workflow: terraform-ci
+
+The plan/apply pattern is also published as a reusable workflow in
+`platform-workflows` so any repo with Terraform can consume it:
+
+```yaml
+# In any repo's .github/workflows/infra.yml:
+jobs:
+  plan:
+    uses: terzo241-platform/platform-workflows/.github/workflows/terraform-ci.yml@main
+    with:
+      working_directory: "terraform/"
+      environment: "dev"
+      plan_only: true
+    secrets:
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      tf_service_account: ${{ vars.TF_SERVICE_ACCOUNT }}
+```
+
+Same pattern as Day 2's centralized CI workflows: one definition, consumed by many
+repos. Security scanning, format checking, and plan commenting come for free.
+
+---
+
+## 11. The Bottom Line: What This Module Really Is
 
 This Terraform module is not infrastructure code. It's the **encoded institutional
 memory** of every incident, every compliance finding, every cost overrun, and every
